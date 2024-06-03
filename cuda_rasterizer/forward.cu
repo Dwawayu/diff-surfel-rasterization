@@ -187,7 +187,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
-	const float* colors_precomp,
+	// const float* colors_precomp,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const glm::vec3* cam_pos,
@@ -259,12 +259,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		return;
 
 	// compute colors 
-	if (colors_precomp == nullptr) {
-		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
-		rgb[idx * C + 0] = result.x;
-		rgb[idx * C + 1] = result.y;
-		rgb[idx * C + 2] = result.z;
-	}
+	// if (colors_precomp == nullptr) {
+	glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
+	rgb[idx * C + 0] = result.x;
+	rgb[idx * C + 1] = result.y;
+	rgb[idx * C + 2] = result.z;
+	// }
 
 	// assign values
 	depths[idx] = p_view.z;
@@ -291,14 +291,17 @@ renderCUDA(
 	float focal_x, float focal_y,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+	const float* __restrict__ features_misc,
 	const float* __restrict__ cov3Ds,
 	const float* __restrict__ depths,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
+	const int channel_misc,
 	float* __restrict__ out_color,
-	float* __restrict__ out_depth)
+	float* __restrict__ out_depth,
+	float* __restrict__ out_misc)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -346,6 +349,12 @@ renderCUDA(
 	float max_contributor = {-1};
 
 #endif
+
+	extern __shared__ float acc_miscs[];
+	// float misc[3] = { 0 };
+	float* misc = acc_miscs + channel_misc * block.thread_rank();
+	for (int ch = 0; ch < channel_misc; ch++)
+		misc[ch] = 0;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -430,6 +439,7 @@ renderCUDA(
 				continue;
 			}
 
+			float weight = alpha * T;
 
 #if RENDER_AXUTILITY
 // render distortion map
@@ -440,12 +450,12 @@ renderCUDA(
 			float mapped_depth = depth;
 #endif
 			float error = mapped_depth * mapped_depth * A + dist2 - 2 * mapped_depth * dist1;
-			distortion += error * alpha * T;
+			distortion += error * weight;
 
 			// if (alpha * T >= max_weight) {
 			if (T > 0.5) {
 				max_depth = depth;
-				max_weight = alpha * T;
+				max_weight = weight;
 				max_contributor = contributor;
 			}
 
@@ -467,18 +477,20 @@ renderCUDA(
 			}
 #endif
 			// render normal map
-			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * alpha * T;
+			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * weight;
 
 			// render depth map
-			D += depth * alpha * T;
+			D += depth * weight;
 			// mapped depth
-			dist1 += mapped_depth * alpha * T;
-			dist2 += mapped_depth * mapped_depth * alpha * T;
+			dist1 += mapped_depth * weight;
+			dist2 += mapped_depth * mapped_depth * weight;
 #endif
 
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * weight;
+			for (int ch = 0; ch < channel_misc; ch++)
+				misc[ch] += features_misc[collected_id[j] * channel_misc + ch] * weight;
 			T = test_T;
 
 			// Keep track of last range entry to update this
@@ -495,6 +507,8 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		for (int ch = 0; ch < channel_misc; ch++)
+			out_misc[ch * H * W + pix_id] = misc[ch];
 
 #if RENDER_AXUTILITY
 		n_contrib[pix_id + H * W] = max_contributor;
@@ -518,30 +532,36 @@ void FORWARD::render(
 	float focal_x, float focal_y,
 	const float2* means2D,
 	const float* colors,
+	const float* colors_precomp,
 	const float* cov3Ds,
 	const float* depths,
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
+	const int channel_misc,
 	float* out_color,
-	float* out_depth)
+	float* out_depth,
+	float* out_misc)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+	renderCUDA<NUM_CHANNELS> << <grid, block, channel_misc * BLOCK_SIZE * sizeof(float)>> > (
 		ranges,
 		point_list,
 		W, H,
 		focal_x, focal_y,
 		means2D,
 		colors,
+		colors_precomp,
 		cov3Ds,
 		depths,
 		conic_opacity,
 		final_T,
 		n_contrib,
 		bg_color,
+		channel_misc,
 		out_color,
-		out_depth);
+		out_depth,
+		out_misc);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
@@ -553,7 +573,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
-	const float* colors_precomp,
+	// const float* colors_precomp,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const glm::vec3* cam_pos,
@@ -580,7 +600,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		shs,
 		clamped,
 		cov3D_precomp,
-		colors_precomp,
+		// colors_precomp,
 		viewmatrix, 
 		projmatrix,
 		cam_pos,

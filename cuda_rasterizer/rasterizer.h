@@ -48,8 +48,10 @@ namespace CudaRasterizer
 			const float* cam_pos,
 			const float tan_fovx, float tan_fovy,
 			const bool prefiltered,
+			const int channel_misc,
 			float* out_color,
 			float* out_depth,
+			float* out_misc,
 			int* radii = nullptr,
 			bool debug = false);
 
@@ -74,15 +76,20 @@ namespace CudaRasterizer
 			char* image_buffer,
 			const float* dL_dpix,
 			const float* dL_depths,
+			const float* dL_dmiscs,
+			const int channel_misc,
 			float* dL_dmean2D,
 			float* dL_dconic,
 			float* dL_dopacity,
-			float* dL_dcolor,
+			// float* dL_dcolor,
+			float* dL_dmisc_precomp,
 			float* dL_dmean3D,
 			float* dL_dcov3D,
 			float* dL_dsh,
 			float* dL_dscale,
 			float* dL_drot,
+			float* dL_dview,
+			float* dL_dproj,
 			bool debug);
 	};
 };

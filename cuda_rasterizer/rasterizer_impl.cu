@@ -215,8 +215,10 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* cam_pos,
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
+	const int channel_misc,
 	float* out_color,
 	float* out_depth,
+	float* out_misc,
 	int* radii,
 	bool debug)
 {
@@ -256,7 +258,7 @@ int CudaRasterizer::Rasterizer::forward(
 		shs,
 		geomState.clamped,
 		cov3D_precomp,
-		colors_precomp,
+		// colors_precomp,
 		viewmatrix, projmatrix,
 		(glm::vec3*)cam_pos,
 		width, height,
@@ -319,7 +321,8 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(, debug)
 
 	// Let each tile blend its range of Gaussians independently in parallel
-	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	// const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	const float* feature_ptr = geomState.rgb;
 	const float* cov3D_ptr = cov3D_precomp != nullptr ? cov3D_precomp : geomState.cov3D;
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
@@ -329,14 +332,17 @@ int CudaRasterizer::Rasterizer::forward(
 		focal_x, focal_y,
 		geomState.means2D,
 		feature_ptr,
+		colors_precomp,
 		cov3D_ptr,
 		geomState.depths,
 		geomState.conic_opacity,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
+		channel_misc,
 		out_color,
-		out_depth), debug)
+		out_depth,
+		out_misc), debug)
 
 	return num_rendered;
 }
@@ -364,15 +370,20 @@ void CudaRasterizer::Rasterizer::backward(
 	char* img_buffer,
 	const float* dL_dpix,
 	const float* dL_depths,
+	const float* dL_dmiscs,
+	const int channel_misc,
 	float* dL_dmean2D,
 	float* dL_dnormal,
 	float* dL_dopacity,
-	float* dL_dcolor,
+	// float* dL_dcolor,
+	float* dL_dmisc_precomp,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
+	float* dL_dview,
+	float* dL_dproj,
 	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -390,10 +401,15 @@ void CudaRasterizer::Rasterizer::backward(
 	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
 
+	float* dL_dcolors;
+	CHECK_CUDA(cudaMalloc((void**) &dL_dcolors, P * NUM_CHANNELS * sizeof(float)), debug);
+	CHECK_CUDA(cudaMemset(dL_dcolors, 0, P * NUM_CHANNELS * sizeof(float)), debug);
+
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
-	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
+	// const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
+	const float* color_ptr = geomState.rgb;
 	const float* depth_ptr = geomState.depths;
 	const float* cov3D_ptr = (cov3D_precomp != nullptr) ? cov3D_precomp : geomState.cov3D;
 	CHECK_CUDA(BACKWARD::render(
@@ -407,17 +423,22 @@ void CudaRasterizer::Rasterizer::backward(
 		geomState.means2D,
 		geomState.conic_opacity,
 		color_ptr,
+		colors_precomp,
 		cov3D_ptr,
 		depth_ptr,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,
 		dL_depths,
+		dL_dmiscs,
+		channel_misc,
 		dL_dcov3D,
 		(float3*)dL_dmean2D,
 		dL_dnormal,
 		dL_dopacity,
-		dL_dcolor), debug)
+		// dL_dcolor,
+		dL_dmisc_precomp,
+		dL_dcolors), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -440,9 +461,14 @@ void CudaRasterizer::Rasterizer::backward(
 		(float3*)dL_dmean2D, // gradient inputs
 		dL_dnormal,		     // gradient inputs
 		dL_dcov3D,
-		dL_dcolor,
+		// dL_dcolor,
+		dL_dcolors,
 		dL_dsh,
 		(glm::vec3*)dL_dmean3D,
 		(glm::vec2*)dL_dscale,
-		(glm::vec4*)dL_drot), debug)
+		(glm::vec4*)dL_drot,
+		(glm::mat4*)dL_dview,
+		(glm::mat4*)dL_dproj), debug)
+
+	cudaFree(dL_dcolors);
 }
